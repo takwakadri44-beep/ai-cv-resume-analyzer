@@ -2,5 +2,4 @@ streamlit
 PyMuPDF
 scikit-learn
 sentence-transformers
-keybert
 numpy
