@@ -5,10 +5,7 @@ import fitz
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-
 from sentence_transformers import SentenceTransformer
-from keybert import KeyBERT
-
 
 st.set_page_config(
     page_title="AI CV Analyzer",
@@ -17,372 +14,210 @@ st.set_page_config(
 )
 
 st.title("📄 AI CV / Resume Analyzer")
-st.write(
-    "Compare any CV with any Job Description using AI — "
-    "without a predefined skills dictionary."
-)
+st.caption("AI-powered CV ↔ Job Description matching — no predefined skills dictionary.")
 
-
-@st.cache_resource
-def load_models():
-
-    model = SentenceTransformer(
-        "paraphrase-multilingual-MiniLM-L12-v2"
-    )
-
-    keyword_model = KeyBERT(model=model)
-
-    return model, keyword_model
-
+@st.cache_resource(show_spinner="🤖 Loading AI model (first time only)...")
+def load_model():
+    return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
 def extract_pdf(file):
-
     data = file.read()
+    doc = fitz.open(stream=data, filetype="pdf")
+    return "\n".join(page.get_text("text") for page in doc)
 
-    document = fitz.open(
-        stream=data,
-        filetype="pdf"
-    )
+def clean(text):
+    return re.sub(r"\s+", " ", text or "").strip()
 
-    text = ""
+def tfidf_score(cv, job):
+    v = TfidfVectorizer(ngram_range=(1, 2))
+    x = v.fit_transform([cv, job])
+    return float(cosine_similarity(x[0:1], x[1:2])[0, 0] * 100)
 
-    for page in document:
-        text += page.get_text()
+def dynamic_concepts(text, n=15):
+    """
+    No fixed skills dictionary.
+    Concepts are discovered directly from the supplied document
+    using TF-IDF n-grams.
+    """
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
 
-    return text
-
-
-def clean_text(text):
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
-    return text.strip()
-
-
-def tfidf_similarity(cv, job):
+    if not sentences:
+        sentences = [text]
 
     vectorizer = TfidfVectorizer(
-        ngram_range=(1, 2)
+        ngram_range=(1, 3),
+        max_features=500,
+        min_df=1
     )
 
-    vectors = vectorizer.fit_transform(
-        [cv, job]
+    matrix = vectorizer.fit_transform(sentences)
+    scores = np.asarray(matrix.mean(axis=0)).ravel()
+    terms = vectorizer.get_feature_names_out()
+
+    ranked = sorted(
+        zip(terms, scores),
+        key=lambda x: x[1],
+        reverse=True
     )
 
-    similarity = cosine_similarity(
-        vectors[0:1],
-        vectors[1:2]
-    )[0][0]
+    concepts = []
+    for term, score in ranked:
+        term = term.strip()
+        if len(term) < 3:
+            continue
+        if term not in concepts:
+            concepts.append(term)
+        if len(concepts) >= n:
+            break
 
-    return similarity * 100
+    return concepts
 
-
-def semantic_similarity(cv, job, model):
-
-    embeddings = model.encode(
-        [cv, job],
-        normalize_embeddings=True
-    )
-
-    similarity = np.dot(
-        embeddings[0],
-        embeddings[1]
-    )
-
-    return similarity * 100
-
-
-def extract_concepts(text, keyword_model):
-
-    keywords = keyword_model.extract_keywords(
-        text,
-        keyphrase_ngram_range=(1, 3),
-        stop_words=None,
-        top_n=20,
-        use_mmr=True,
-        diversity=0.6
-    )
-
-    return [
-        keyword
-        for keyword, score in keywords
-    ]
-
-
-def compare_concepts(
-    cv_concepts,
-    job_concepts,
-    model
-):
-
-    if not cv_concepts:
-
+def semantic_concept_match(cv_concepts, job_concepts, model):
+    if not cv_concepts or not job_concepts:
         return [], [], job_concepts
 
-    cv_embeddings = model.encode(
+    cv_emb = model.encode(
         cv_concepts,
-        normalize_embeddings=True
+        normalize_embeddings=True,
+        show_progress_bar=False
     )
-
-    job_embeddings = model.encode(
+    job_emb = model.encode(
         job_concepts,
-        normalize_embeddings=True
+        normalize_embeddings=True,
+        show_progress_bar=False
     )
 
-    similarities = np.matmul(
-        job_embeddings,
-        cv_embeddings.T
-    )
+    sims = np.matmul(job_emb, cv_emb.T)
 
-    strong = []
-    partial = []
-    missing = []
+    strong, partial, missing = [], [], []
 
     for i, concept in enumerate(job_concepts):
+        best = float(np.max(sims[i]))
 
-        best_similarity = np.max(
-            similarities[i]
-        )
-
-        if best_similarity >= 0.72:
-
-            strong.append(concept)
-
-        elif best_similarity >= 0.48:
-
-            partial.append(concept)
-
+        if best >= 0.70:
+            strong.append((concept, best))
+        elif best >= 0.48:
+            partial.append((concept, best))
         else:
-
-            missing.append(concept)
+            missing.append((concept, best))
 
     return strong, partial, missing
 
-
-st.sidebar.title("⚙️ Settings")
-
-st.sidebar.info(
-    """
-This application does NOT use a fixed
-skills dictionary.
-
-The AI discovers important concepts
-directly from the CV and Job Description.
-"""
+cv_file = st.file_uploader(
+    "📄 Upload CV / Resume",
+    type=["pdf"]
 )
 
-
-col1, col2 = st.columns(2)
-
-
-with col1:
-
-    cv_file = st.file_uploader(
-        "📄 Upload CV / Resume",
-        type=["pdf"]
-    )
-
-
-with col2:
-
-    job_file = st.file_uploader(
-        "💼 Upload Job Description",
-        type=["txt"]
-    )
-
+job_file = st.file_uploader(
+    "💼 Upload Job Description",
+    type=["txt"]
+)
 
 if cv_file and job_file:
 
-    cv_text = clean_text(
-        extract_pdf(cv_file)
-    )
-
-    job_text = clean_text(
-        job_file.read().decode(
-            "utf-8",
-            errors="ignore"
-        )
+    cv_text = clean(extract_pdf(cv_file))
+    job_text = clean(
+        job_file.read().decode("utf-8", errors="ignore")
     )
 
     if not cv_text:
-
-        st.error(
-            "Could not extract text from the CV."
-        )
-
+        st.error("Could not extract text from the CV PDF.")
         st.stop()
 
     if not job_text:
-
-        st.error(
-            "Job Description is empty."
-        )
-
+        st.error("Job Description is empty.")
         st.stop()
 
+    st.success("Documents loaded successfully.")
 
-    st.success(
-        "Documents loaded successfully!"
+    progress = st.progress(0, text="Starting analysis...")
+
+    # 1 — TF-IDF
+    progress.progress(20, text="📊 Approach A: TF-IDF + cosine similarity...")
+    score_a = tfidf_score(cv_text, job_text)
+
+    # 2 — dynamic concept discovery
+    progress.progress(40, text="🔎 Discovering concepts from the documents...")
+    cv_concepts = dynamic_concepts(cv_text)
+    job_concepts = dynamic_concepts(job_text)
+
+    # 3 — AI model
+    progress.progress(55, text="🤖 Loading Sentence Transformer...")
+    model = load_model()
+
+    # 4 — semantic similarity
+    progress.progress(70, text="🧠 Approach B: semantic similarity...")
+    score_b = 0
+
+    embeddings = model.encode(
+        [cv_text, job_text],
+        normalize_embeddings=True,
+        show_progress_bar=False
+    )
+    score_b = float(np.dot(embeddings[0], embeddings[1]) * 100)
+
+    # 5 — concept matching
+    progress.progress(90, text="🔬 Comparing discovered concepts...")
+    strong, partial, missing = semantic_concept_match(
+        cv_concepts,
+        job_concepts,
+        model
     )
 
-
-    with st.spinner(
-        "🤖 AI is analyzing the documents..."
-    ):
-
-        model, keyword_model = load_models()
-
-        tfidf_score = tfidf_similarity(
-            cv_text,
-            job_text
-        )
-
-        semantic_score = semantic_similarity(
-            cv_text,
-            job_text,
-            model
-        )
-
-        cv_concepts = extract_concepts(
-            cv_text,
-            keyword_model
-        )
-
-        job_concepts = extract_concepts(
-            job_text,
-            keyword_model
-        )
-
-        strong, partial, missing = compare_concepts(
-            cv_concepts,
-            job_concepts,
-            model
-        )
-
+    progress.progress(100, text="✅ Analysis complete!")
 
     st.divider()
-
     st.header("📊 Matching Results")
 
+    a, b, c = st.columns(3)
 
-    col1, col2, col3 = st.columns(3)
+    with a:
+        st.metric("Approach A — TF-IDF", f"{score_a:.1f}%")
 
-
-    with col1:
-
+    with b:
         st.metric(
-            "TF-IDF",
-            f"{tfidf_score:.1f}%"
+            "Approach B — Sentence Transformers",
+            f"{score_b:.1f}%"
         )
 
-
-    with col2:
-
-        st.metric(
-            "Sentence Transformers",
-            f"{semantic_score:.1f}%"
+    with c:
+        winner = (
+            "Sentence Transformers"
+            if score_b >= score_a
+            else "TF-IDF"
         )
-
-
-    with col3:
-
-        if semantic_score >= tfidf_score:
-
-            winner = "Sentence Transformers"
-
-        else:
-
-            winner = "TF-IDF"
-
-        st.metric(
-            "Better Approach",
-            winner
-        )
-
+        st.metric("Better approach", winner)
 
     st.divider()
-
-    st.header(
-        "🧠 Dynamic Skill / Concept Analysis"
+    st.header("🧠 Dynamic Concept Analysis")
+    st.caption(
+        "No predefined skills list is used. Concepts are discovered "
+        "from the uploaded documents and compared semantically."
     )
 
-    st.write(
-        "The concepts below are discovered "
-        "automatically from the documents."
-    )
+    x, y, z = st.columns(3)
 
+    with x:
+        st.subheader("🟢 Strong")
+        for concept, score in strong:
+            st.write(f"✓ **{concept}**")
 
-    col1, col2, col3 = st.columns(3)
+    with y:
+        st.subheader("🟡 Partial")
+        for concept, score in partial:
+            st.write(f"~ **{concept}**")
 
+    with z:
+        st.subheader("🔴 Missing / weak")
+        for concept, score in missing:
+            st.write(f"✗ **{concept}**")
 
-    with col1:
+    with st.expander("🔎 Concepts discovered in CV"):
+        st.write(", ".join(cv_concepts))
 
-        st.subheader(
-            "🟢 Strong Match"
-        )
-
-        for concept in strong:
-
-            st.write(
-                "✓",
-                concept
-            )
-
-
-    with col2:
-
-        st.subheader(
-            "🟡 Partial Match"
-        )
-
-        for concept in partial:
-
-            st.write(
-                "~",
-                concept
-            )
-
-
-    with col3:
-
-        st.subheader(
-            "🔴 Missing / Weak"
-        )
-
-        for concept in missing:
-
-            st.write(
-                "✗",
-                concept
-            )
-
-
-    st.divider()
-
-    st.subheader(
-        "🔎 Concepts discovered in CV"
-    )
-
-    st.write(
-        ", ".join(cv_concepts)
-    )
-
-
-    st.subheader(
-        "🔎 Concepts discovered in Job Description"
-    )
-
-    st.write(
-        ", ".join(job_concepts)
-    )
-
+    with st.expander("🔎 Concepts discovered in Job Description"):
+        st.write(", ".join(job_concepts))
 
 else:
-
-    st.info(
-        "Upload a CV PDF and a Job Description TXT to start."
-  )
+    st.info("Upload a CV PDF and a Job Description TXT to start.")
